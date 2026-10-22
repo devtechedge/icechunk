@@ -485,6 +485,9 @@ const COMPRESSION_ALG_NONE: u8 = 0;
 const COMPRESSION_ALG_ZSTD_DICT: u8 = 1;
 // This is the maximum size we support for a virtual chunk url that will be compressed
 const MAX_DECOMPRESSED_LOCATION_SIZE: usize = 1_024;
+/// Upper bound on the size a compressed location frame can declare. Longer
+/// locations go to the heap, but we never trust the frame header beyond this.
+const MAX_HEAP_DECOMPRESSED_LOCATION_SIZE: u64 = 64 * 1_024;
 
 #[derive(PartialEq)]
 pub struct Manifest {
@@ -802,10 +805,31 @@ fn ref_to_payload(
             .capture()?;
         // Carefully so we don't keep the whole string buffer in memory
         let mut buffer = [0u8; MAX_DECOMPRESSED_LOCATION_SIZE];
-        let len = decompressor
-            .decompress_to_buffer(compressed.bytes(), &mut buffer)
-            .capture()?;
-        let location_string = std::str::from_utf8(&buffer[..len])
+        let bytes = compressed.bytes();
+        let large;
+        let decoded: &[u8] = match zstd::zstd_safe::get_frame_content_size(bytes) {
+            Ok(Some(size)) if size > MAX_DECOMPRESSED_LOCATION_SIZE as u64 => {
+                if size > MAX_HEAP_DECOMPRESSED_LOCATION_SIZE {
+                    return Err(IcechunkFormatErrorKind::IO(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "compressed virtual chunk location declares {size} bytes, more than the {MAX_HEAP_DECOMPRESSED_LOCATION_SIZE} byte limit"
+                        ),
+                    )))
+                    .capture();
+                }
+                #[expect(clippy::cast_possible_truncation)]
+                let size = size as usize;
+                large = decompressor.decompress(bytes, size).capture()?;
+                &large
+            }
+            _ => {
+                let len =
+                    decompressor.decompress_to_buffer(bytes, &mut buffer).capture()?;
+                &buffer[..len]
+            }
+        };
+        let location_string = std::str::from_utf8(decoded)
             .map_err(|e| {
                 IcechunkFormatErrorKind::IO(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1473,6 +1497,27 @@ mod tests {
             }
         }
 
+        for chunk in &chunks {
+            let payload = manifest.get_chunk_payload(&chunk.node, &chunk.coord).unwrap();
+            assert_eq!(payload, chunk.payload);
+        }
+        Ok(())
+    }
+
+    #[tokio_test]
+    async fn test_compression_long_location_round_trip() -> Result<(), Box<dyn Error>> {
+        let mut chunks = make_virtual_chunks(50);
+        let long = format!("s3://my-bucket/{}/chunk", "x".repeat(2000));
+        if let ChunkPayload::Virtual(v) = &mut chunks[0].payload {
+            v.location = VirtualChunkLocation::from_url(&long).unwrap();
+        }
+        let manifest = Manifest::from_iter(
+            &ManifestId::random(),
+            chunks.clone(),
+            Some(&COMPRESS_CONFIG),
+        )
+        .await?
+        .unwrap();
         for chunk in &chunks {
             let payload = manifest.get_chunk_payload(&chunk.node, &chunk.coord).unwrap();
             assert_eq!(payload, chunk.payload);
